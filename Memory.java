@@ -4,12 +4,16 @@ class Memory {
 	//scanner is stored here as a static field so it is avaiable to the execute method for factor
 	public static CoreScanner data;
 	
-	// Class and data structures to represent variables
+	static class HeapObject {
+		String defaultKey;
+		Map<String,Integer> map = new HashMap<>();
+		int rc = 0;
+	}
+
 	static class Variable {
 		Core type;
 		int integerVal;
-		String defaultKey;
-		Map<String, Integer> mapVal;
+		HeapObject obj;
 		Variable(Core t) {
 			this.type = t;
 		}
@@ -17,9 +21,26 @@ class Memory {
 	
 	public static HashMap<String, Variable> global;
 	public static Stack<Stack<HashMap<String, Variable>>> local;
-
-	
 	public static HashMap<String, Function> funcMap;
+
+	private static int reachableCount = 0;
+
+	private static void incRef(HeapObject o) {
+		if (o == null) return;
+		if (o.rc == 0) {
+			reachableCount++;
+			System.out.println("gc:" + reachableCount);
+		}
+		o.rc++;
+	}
+	private static void decRef(HeapObject o) {
+		if (o == null) return;
+		o.rc--;
+		if (o.rc == 0) {
+			reachableCount--;
+			System.out.println("gc:" + reachableCount);
+		}
+	}
 	
 	// Helper methods to manage memory
 	
@@ -28,10 +49,18 @@ class Memory {
 	public static void initializeGlobal() {
 		global = new HashMap<String, Variable>();
 		funcMap = new HashMap<String, Function>();
+		reachableCount = 0;
 	}
 	
 	// Called at end of Procedure
 	public static void clearGlobal() {
+		if (global != null) {
+			for (Variable v : global.values()) {
+				if (v.type == Core.OBJECT && v.obj != null) {
+					decRef(v.obj);
+				}
+			}
+		}
 		global = null;
 		funcMap = null;
 	}
@@ -51,7 +80,12 @@ class Memory {
 	
 	// Pops a "scope"
 	public static void popScope() {
-		local.peek().pop();
+		HashMap<String, Variable> scope = local.peek().pop();
+		for (Variable v : scope.values()) {
+			if (v.type == Core.OBJECT && v.obj != null) {
+				decRef(v.obj);
+			}
+		}
 	}
 	
 	// Handles decl integer
@@ -76,20 +110,27 @@ class Memory {
 	
 	// Retrives a value from memory (integer or array at index 0)
 	public static int load(String id) {
-		int value;
 		Variable v = getLocalOrGlobal(id);
 		if (v.type == Core.INTEGER) {
-			value = v.integerVal;
-		} else {
-			value = v.mapVal.get(v.defaultKey);
+			return v.integerVal;
 		}
-		return value;
+		if (v.obj == null) {
+			System.out.println("ERROR: Null object access: " + id);
+			System.exit(0);
+		}
+		Integer val = v.obj.map.get(v.obj.defaultKey);
+		return val == null ? 0 : val;
 	}
 	
 	// Retrieves a value using the key
 	public static int load(String id, String key) {
 		Variable v = getLocalOrGlobal(id);
-		return v.mapVal.get(key);
+		if (v.type != Core.OBJECT || v.obj == null) {
+			System.out.println("ERROR: Null object access: " + id);
+			System.exit(0);
+		}
+		Integer val = v.obj.map.get(key);
+		return val == null ? 0 : val;
 	}
 	
 	// Stores a value (integer or map at default key)
@@ -98,30 +139,55 @@ class Memory {
 		if (v.type == Core.INTEGER) {
 			v.integerVal = value;
 		} else {
-			v.mapVal.put(v.defaultKey, value);
+			if (v.obj == null) {
+				System.out.println("ERROR: Null object store: " + id);
+				System.exit(0);
+			}
+			v.obj.map.put(v.obj.defaultKey, value);
 		}
 	}
 	
 	// Stores a value at key
 	public static void store(String id, String key, int value) {
 		Variable v = getLocalOrGlobal(id);
-		v.mapVal.put(key, value);
+		if (v.type != Core.OBJECT || v.obj == null) {
+			System.out.println("ERROR: Null object store: " + id);
+			System.exit(0);
+		}
+		v.obj.map.put(key, value);
 	}
 	
 	// Handles "new object" assignment
 	public static void allocate(String id, String key, int value) {
 		Variable v = getLocalOrGlobal(id);
-		v.mapVal = new HashMap<>();
-		v.defaultKey = key;
-		v.mapVal.put(v.defaultKey, value);
+		if (v.type != Core.OBJECT) {
+			System.out.println("ERROR: allocate on non-object: " + id);
+			System.exit(0);
+		}
+		if (v.obj != null) {
+			decRef(v.obj);
+		}
+
+		HeapObject o = new HeapObject();
+		o.defaultKey = key;
+		o.map.put(key, value);
+		incRef(o);
+		v.obj = o;
 	}
 	
 	// Handles "id : id" assignment
 	public static void alias(String lhs, String rhs) {
 		Variable v1 = getLocalOrGlobal(lhs);
 		Variable v2 = getLocalOrGlobal(rhs);
-		v1.mapVal = v2.mapVal;
-		v1.defaultKey = v2.defaultKey;
+		if (v1.type != Core.OBJECT || v2.type != Core.OBJECT) {
+			System.out.println("ERROR: alias requires object variables: " + lhs + ", " + rhs);
+			System.exit(0);
+		}
+		if (v1.obj != null) {
+			decRef(v1.obj);
+		}
+		v1.obj = v2.obj;
+		incRef(v1.obj);
 	}
 	
 	// Looks up value of the variables, searches local then global
@@ -148,31 +214,40 @@ class Memory {
 	 *
 	 */
 
-	 public static void pushFrameAndExecute(String name, Parameter args) {
-		 Function f = funcMap.get(name);
+	public static void pushFrameAndExecute(String name, Parameter args) {
+		Function f = funcMap.get(name);
 		 
-		 ArrayList<String> formals = f.param.execute();
-		 ArrayList<String> arguments = args.execute();
+		ArrayList<String> formals = f.param.execute();
+		ArrayList<String> arguments = args.execute();
 		 
-		 Stack<HashMap<String, Variable>> frame = new Stack<HashMap<String, Variable>>();
-		 frame.push(new HashMap<String, Variable>());
+		Stack<HashMap<String, Variable>> frame = new Stack<HashMap<String, Variable>>();
+		frame.push(new HashMap<String, Variable>());
 		 
-		 for (int i=0; i<arguments.size(); i++) {
-			 Variable v1 = getLocalOrGlobal(arguments.get(i));
-			 Variable v2 = new Variable(Core.OBJECT);
-			 v2.mapVal = v1.mapVal;
-			 v2.defaultKey = v1.defaultKey;
-			 frame.peek().put(formals.get(i), v2);
-		 }
-		 
-		 local.push(frame);
-		 
-		 f.ss.execute();
-	 }
-	 
-	 public static void popFrame() {
-		 local.pop();
-	 }
-	 
-	 
+		for (int i=0; i<arguments.size(); i++) {
+			Variable v1 = getLocalOrGlobal(arguments.get(i));
+			Variable v2;
+			if (v1.type == Core.OBJECT) {
+				v2 = new Variable(Core.OBJECT);
+				v2.obj = v1.obj;
+				incRef(v2.obj);
+			} else {
+				v2 = new Variable(Core.INTEGER);
+				v2.integerVal = v1.integerVal;
+			}
+			frame.peek().put(formals.get(i), v2);
+		}
+		local.push(frame);	 
+		f.ss.execute();
+	}
+	public static void popFrame() {
+		Stack<HashMap<String, Variable>> frame = local.pop();
+		while (!frame.isEmpty()) {
+			HashMap<String, Variable> scope = frame.pop();
+			for (Variable v : scope.values()) {
+				if (v.type == Core.OBJECT && v.obj != null) {
+					decRef(v.obj);
+				}
+			}
+		}
+	}
 }
